@@ -15,66 +15,62 @@ Claude session cannot carry that (the drag / inline-CSV / SQL all route the data
 through the session). A GitHub Actions runner can POST the whole CSV in one HTTP
 call, and reuses the validated Python parsers (no TS re-port, no duplicate logic).
 
-ENV (GitHub repo secrets):
-  SUPABASE_URL                 e.g. https://djmbiqzwkwlhkxjporww.supabase.co
-  SUPABASE_SERVICE_ROLE_KEY    service role key (bucket download + REST reads)
-  HUB_CRON_SECRET              value of public.get_cron_secret() (edge-fn auth)
-Optional:
-  CARRIERS                     comma list to restrict (e.g. "dhl_nl,dx")
-  DRY_RUN                      "1" = parse + tie-check + report, do not load
+ONE SECRET ONLY. Discovery, download and load all go through cron-secret-gated edge
+functions (`loader-feed` for list/download, `ingest-combined-inline` for load), so the
+Supabase service role key never leaves Supabase. The only GitHub secret is HUB_CRON_SECRET.
+
+ENV:
+  HUB_CRON_SECRET   (GitHub secret, required)  value of public.get_cron_secret()
+  SUPABASE_URL      (optional)  defaults to the Hub project URL below
+  CARRIERS          (optional)  comma list to restrict (e.g. "dhl_nl,geodis")
+  DRY_RUN           (optional)  "1" = parse + tie-check + report, do not load
 """
-import os, sys, io, json, re, base64, urllib.parse, datetime
+import os, sys, io, json, re, base64, datetime
 import requests
 
 from carrier_registry import REGISTRY, carrier_id_for, invoice_no_from_filename
 
-SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
-SERVICE_KEY  = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://djmbiqzwkwlhkxjporww.supabase.co").rstrip("/")
 CRON_SECRET  = os.environ["HUB_CRON_SECRET"]
-BUCKET       = "carrier-invoice-sources"
 DRY_RUN      = os.environ.get("DRY_RUN") == "1"
 ONLY         = {c.strip() for c in os.environ.get("CARRIERS", "").split(",") if c.strip()}
 
-REST = f"{SUPABASE_URL}/rest/v1"
-SB_HEADERS = {"apikey": SERVICE_KEY, "Authorization": f"Bearer {SERVICE_KEY}"}
-INGEST_URL = f"{SUPABASE_URL}/functions/v1/ingest-combined-inline"
+FN           = f"{SUPABASE_URL}/functions/v1"
+FEED_URL     = f"{FN}/loader-feed"
+INGEST_URL   = f"{FN}/ingest-combined-inline"
+CRON_HEADERS = {"Content-Type": "application/json", "x-cron-secret": CRON_SECRET}
+
+
+_FEED = None
+def _feed():
+    """Fetch the stored-file list and the already-loaded set in one cron-gated call."""
+    global _FEED
+    if _FEED is None:
+        r = requests.post(FEED_URL, headers=CRON_HEADERS, data=json.dumps({"action": "list"}), timeout=120)
+        r.raise_for_status()
+        _FEED = r.json()
+    return _FEED
 
 
 def fetch_stored():
     """Intake rows that have a stored file, newest first."""
-    r = requests.get(f"{REST}/carrier_invoice_intake_log", headers=SB_HEADERS, params={
-        "select": "carrier_key,filename,storage_path,status,received_at",
-        "status": "eq.stored", "order": "received_at.desc",
-    }, timeout=60)
-    r.raise_for_status()
-    return r.json()
+    return _feed().get("stored", [])
 
 
 def fetch_loaded():
     """Set of (carrier_id, invoice_number) already in the Hub."""
-    out, offset = set(), 0
-    while True:
-        r = requests.get(f"{REST}/carrier_invoice_records", headers={**SB_HEADERS, "Range-Unit": "items",
-            "Range": f"{offset}-{offset+999}"}, params={"select": "carrier_id,invoice_number"}, timeout=60)
-        r.raise_for_status()
-        rows = r.json()
-        for x in rows:
-            out.add((x["carrier_id"], str(x["invoice_number"])))
-        if len(rows) < 1000:
-            break
-        offset += 1000
-    return out
+    return {(cid, str(inv)) for cid, inv in _feed().get("loaded", [])}
 
 
 def download(storage_path):
-    url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{urllib.parse.quote(storage_path)}"
-    r = requests.get(url, headers={"Authorization": f"Bearer {SERVICE_KEY}"}, timeout=120)
+    r = requests.post(FEED_URL, headers=CRON_HEADERS,
+                      data=json.dumps({"action": "download", "path": storage_path}), timeout=120)
     r.raise_for_status()
-    return r.content
+    return base64.b64decode(r.json()["b64"])
 
 
 def ingest(kind, filename, csv_text):
-    r = requests.post(INGEST_URL, headers={"Content-Type": "application/json", "x-cron-secret": CRON_SECRET},
+    r = requests.post(INGEST_URL, headers=CRON_HEADERS,
                       data=json.dumps({"kind": kind, "filename": filename, "csv": csv_text}), timeout=300)
     ok = r.status_code < 300
     return ok, (r.json() if ok else r.text[:400])
