@@ -30,7 +30,7 @@ import requests
 
 from carrier_registry import REGISTRY, carrier_id_for, invoice_no_from_filename
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://djmbiqzwkwlhkxjporww.supabase.co").rstrip("/")
+SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "https://djmbiqzwkwlhkxjporww.supabase.co").rstrip("/")
 CRON_SECRET  = os.environ["HUB_CRON_SECRET"]
 DRY_RUN      = os.environ.get("DRY_RUN") == "1"
 ONLY         = {c.strip() for c in os.environ.get("CARRIERS", "").split(",") if c.strip()}
