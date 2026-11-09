@@ -1,0 +1,44 @@
+name: carrier-loader
+
+on:
+  schedule:
+    - cron: "37 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "1 = parse + tie-check only, do not load"
+        required: false
+        default: "0"
+      carriers:
+        description: "comma list to restrict (e.g. dhl_nl,geodis). blank = all wired"
+        required: false
+        default: ""
+
+concurrency:
+  group: carrier-loader
+  cancel-in-progress: false
+
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install poppler (pdftotext, for the PDF carriers)
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run loader
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          HUB_CRON_SECRET: ${{ secrets.HUB_CRON_SECRET }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          CARRIERS: ${{ github.event.inputs.carriers }}
+        run: python worker.py
