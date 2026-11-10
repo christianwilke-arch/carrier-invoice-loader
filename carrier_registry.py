@@ -58,6 +58,8 @@ def invoice_no_from_filename(ckey, fname):
         m = re.search(r"(\d{9,12})", base); return m.group(1) if m else None
     if ckey == "chronopost":       # 13796660_...pdf
         m = re.search(r"(\d{8})", base); return m.group(1) if m else None
+    if ckey == "dpd_nl":           # Invoice_319301_26103376.pdf -> invoice no is the 2nd number
+        m = re.search(r"_(\d{6,9})\.pdf$", base, re.I); return m.group(1) if m else None
     m = re.search(r"(\d{6,12})", base); return m.group(1) if m else None
 
 # ---------------------------------------------------------------------------
@@ -219,6 +221,20 @@ def build_dpd_fr(raw, fname, inv):
 # invoice-level line (the parser itemises base 'porte' only), so ~14% of spend is
 # invoice-level, not per-order — reconciliation still matches the per-parcel base.
 # ---------------------------------------------------------------------------
+def build_dpd_nl(raw, fname, inv):
+    # DPD NL invoices are aggregated (service x country + named surcharges, no parcel/order refs).
+    # Loads country-level base + named invoice-level surcharges, tied to the Gross total.
+    # It CANNOT reconcile per order_item — the invoice carries no order references.
+    import parsers.dpd_nl_detail as m
+    lines, meta = m.parse_full(_tmp(raw, ".pdf"))
+    real = meta.get("invoice_id") or inv
+    res = _lines_to_csv(lines, "dpd_nl", real, os.path.basename(fname))
+    gross = meta.get("gross")
+    res["control"] = round(gross, 2) if gross else res["parsed"]
+    res["ratio"] = (res["parsed"] / gross) if gross else 0.0
+    res["invoice_id"] = real
+    return res
+
 def build_correos_express(raw, fname, inv):
     import parsers.correos_express as m
     lines = m.parse(_tmp(raw, ".xlsx"))
@@ -236,9 +252,10 @@ REGISTRY = {
     "geodis":          {"match_file": lambda f: f.lower().endswith(".pdf"),  "build": build_geodis},
     "chronopost":      {"match_file": lambda f: f.lower().endswith(".pdf"),  "build": build_chronopost},
     "correos_express": {"match_file": lambda f: f.lower().endswith((".xlsx",".xls")), "build": build_correos_express},
+    "dpd_nl":          {"match_file": lambda f: f.lower().endswith(".pdf"), "build": build_dpd_nl},
     # Validate on the runner (DRY_RUN=1), then uncomment:
     # "dpd_fr":   {"match_file": lambda f: f.lower().endswith((".xlsx",".xls")), "build": build_dpd_fr},
-    # NOT wirable yet — these have only total-only stub parsers (dpd_nl, dhl_be, correos)
-    # or no parser at all (postnl, royal_mail). Each needs its detailed frozen parser
-    # (parcel grain + order_item_id) ported from its carrier audit skill before wiring.
+    # NOT wirable yet — dhl_be & correos have only total-only stub parsers; postnl & royal_mail
+    # have no parser. NOTE dpd_nl is wired but invoice-level only (aggregated invoice, no per-order
+    # reconciliation possible from the format).
 }
