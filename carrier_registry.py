@@ -60,6 +60,8 @@ def invoice_no_from_filename(ckey, fname):
         m = re.search(r"(\d{8})", base); return m.group(1) if m else None
     if ckey == "dpd_nl":           # Invoice_319301_26103376.pdf -> invoice no is the 2nd number
         m = re.search(r"_(\d{6,9})\.pdf$", base, re.I); return m.group(1) if m else None
+    if ckey == "gls_fr":           # "BCF 2501425806 31.10.2026 ...CSV" -> the invoice number
+        m = re.search(r"BCF\s+(\d{6,12})", base, re.I); return m.group(1) if m else None
     m = re.search(r"(\d{6,12})", base); return m.group(1) if m else None
 
 # ---------------------------------------------------------------------------
@@ -252,6 +254,67 @@ def build_correos_express(raw, fname, inv):
     return res
 
 # ---------------------------------------------------------------------------
+# GLS France — BCF detail CSV (one row per parcel, ';'-delimited, decimal comma).
+# order_item_id from Client Reference. Ties on its own component sum (the Facture PDF
+# cross-check is not available to the single-file loader, so control = parsed).
+# ---------------------------------------------------------------------------
+GLS_BASE = "Valeur de Base"
+GLS_SUR = [("SGO","Surcharge gazole"),("CSR","CSR"),("PER","PER"),
+           ("prix kilos additionnel","Additional kg"),("Saisie manuelle","Manual handling")]
+def build_gls(raw, fname, inv):
+    text = None
+    for enc in ("utf-8-sig", "latin-1"):
+        try: text = raw.decode(enc); break
+        except Exception: continue
+    rows = list(csv.DictReader(io.StringIO(text), delimiter=";"))
+    def g(r, k): return (r.get(k) or "").strip()
+    def ref_oiid(r):
+        ref = g(r, "Client Référence") or g(r, "Client Référence 1")
+        if "-" in ref:
+            a, b = ref.split("-", 1); return a.strip(), b.split("_")[0].strip()
+        return "", ""
+    from collections import Counter
+    facs = Counter(g(r, "Facture") for r in rows if g(r, "Facture"))
+    real = facs.most_common(1)[0][0] if facs else (inv or "")
+    comb, sur = [], []; total = 0.0; seen = {}
+    for i, r in enumerate(rows):
+        if not g(r, "Facture"): continue
+        base = _num_eu(r.get(GLS_BASE)); comps = [(lbl, _num_eu(r.get(col))) for col, lbl in GLS_SUR]
+        st = sum(a for _, a in comps); line = round(base + st, 2)
+        if line == 0: continue
+        total += line
+        pn = g(r, "Numéro de colis") or f"GLS-{real}-{i:05d}"
+        if pn in seen: seen[pn] += 1; pnu = f"{pn}.{seen[pn]}"
+        else: seen[pn] = 0; pnu = pn
+        oid, oiid = ref_oiid(r)
+        comb.append({"carrier":"gls","invoice_id":real,"invoice_date":_gls_date(g(r,"Date de la facture")),
+            "tracking":pn,"parcel_no":pnu,"service_raw":g(r,"Hiérarchie produits") or "GLS",
+            "base_charge":round(base,2),"total_surcharges":round(st,2),"total_line_amount":line,"currency":"EUR",
+            "delivery_country":"","delivery_postcode":"","weight_kg":_num_eu(r.get("Poids pour le traitement commande vente")),
+            "pack_count":int(_num_eu(r.get("Nombre de colis")) or 1),"order_id":oid,"order_item_id":oiid,
+            "source_file":os.path.basename(fname)})
+        for lbl, a in comps:
+            if abs(a) > 0.005:
+                sur.append({"invoice_id":real,"tracking":pnu,"charge_class":"gls","charge_code":_slug(lbl),
+                    "surcharge_name":lbl,"amount":round(a,2),"currency":"EUR","source_row_no":i,"ship_date":"","quantity":""})
+    total = round(total, 2)
+    return {"combined": _csv(COMBINED_COLS, comb), "surcharge": _csv(SURCH_COLS, sur),
+            "control": total, "parsed": total, "lines": len(comb), "ratio": 1.0 if total else 0.0,
+            "invoice_id": real}
+
+def _num_eu(s):
+    s = (s or "")
+    s = str(s).replace("\xa0", "").replace(" ", "").replace(",", ".")
+    try: return float(s)
+    except Exception: return 0.0
+def _gls_date(s):
+    import datetime
+    for fmt in ("%d.%m.%Y", "%d/%m/%Y", "%d/%m/%y"):
+        try: return datetime.datetime.strptime((s or "").strip(), fmt).date().isoformat()
+        except Exception: continue
+    return ""
+
+# ---------------------------------------------------------------------------
 REGISTRY = {
     "dpd_uk":          {"match_file": lambda f: f.lower().endswith(".csv"),  "build": build_dpd_uk},
     "dhl_nl":          {"match_file": lambda f: f.lower().endswith(".csv"),  "build": build_dhl_nl},
@@ -260,6 +323,7 @@ REGISTRY = {
     "correos_express": {"match_file": lambda f: f.lower().endswith((".xlsx",".xls")), "build": build_correos_express},
     "dpd_nl":          {"match_file": lambda f: f.lower().endswith(".pdf"), "build": build_dpd_nl},
     "dpd_fr":          {"match_file": lambda f: f.lower().endswith((".xlsx",".xls")), "build": build_dpd_fr},
+    "gls_fr":          {"match_file": lambda f: f.upper().startswith("BCF") and f.lower().endswith(".csv"), "build": build_gls},
     # NOT wirable yet — dhl_be & correos have only total-only stub parsers; postnl & royal_mail
     # have no parser. NOTE dpd_nl is wired but invoice-level only (aggregated invoice, no per-order
     # reconciliation possible from the format).
