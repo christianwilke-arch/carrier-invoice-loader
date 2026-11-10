@@ -93,19 +93,27 @@ def main():
         if not reg["match_file"](fname):
             continue  # not the file type this parser wants (e.g. pdf vs csv)
         inv = invoice_no_from_filename(ckey, fname)
-        if not inv:
-            results.append({"carrier": cid, "file": fname, "status": "skip_no_invoice_no"})
-            continue
-        key = (cid, inv)
-        if key in loaded or key in seen:
-            continue
-        seen.add(key)
+        # When the invoice number comes from the filename, dedup BEFORE downloading.
+        if inv:
+            key = (cid, inv)
+            if key in loaded or key in seen:
+                continue
         try:
             raw = download(row["storage_path"])
-            built = reg["build"](raw, fname, inv)  # -> dict(combined, surcharge, control, parsed, lines, ratio)
+            built = reg["build"](raw, fname, inv)  # -> dict(combined, surcharge, control, parsed, lines, ratio[, invoice_id])
         except Exception as e:
-            results.append({"carrier": cid, "invoice": inv, "status": "parse_error", "error": str(e)[:300]})
+            results.append({"carrier": cid, "invoice": inv or fname, "status": "parse_error", "error": str(e)[:300]})
             continue
+        # Carriers whose number lives inside the file (e.g. correos_express) report it from the build.
+        if not inv:
+            inv = built.get("invoice_id")
+            if not inv:
+                results.append({"carrier": cid, "file": fname, "status": "skip_no_invoice_no"})
+                continue
+            key = (cid, inv)
+            if key in loaded or key in seen:
+                continue
+        seen.add(key)
         ratio = built["ratio"]
         if not (0.95 <= ratio <= 1.002):
             results.append({"carrier": cid, "invoice": inv, "status": "tie_fail",
