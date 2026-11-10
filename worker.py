@@ -46,7 +46,8 @@ def _feed():
     """Fetch the stored-file list and the already-loaded set in one cron-gated call."""
     global _FEED
     if _FEED is None:
-        r = requests.post(FEED_URL, headers=CRON_HEADERS, data=json.dumps({"action": "list"}), timeout=120)
+        # include_drive walks the Drive archive (~90s) for the full 2026 backfill, so allow 240s
+        r = requests.post(FEED_URL, headers=CRON_HEADERS, data=json.dumps({"action": "list"}), timeout=240)
         r.raise_for_status()
         _FEED = r.json()
     return _FEED
@@ -57,9 +58,13 @@ def fetch_stored():
     return _feed().get("stored", [])
 
 
+def _norm(s):
+    """Normalise an invoice number for dedup (some older records stored spaces)."""
+    return str(s or "").replace(" ", "")
+
 def fetch_loaded():
-    """Set of (carrier_id, invoice_number) already in the Hub."""
-    return {(cid, str(inv)) for cid, inv in _feed().get("loaded", [])}
+    """Set of (carrier_id, invoice_number) already in the Hub, space-normalised."""
+    return {(cid, _norm(inv)) for cid, inv in _feed().get("loaded", [])}
 
 
 def download(storage_path):
@@ -95,7 +100,7 @@ def main():
         inv = invoice_no_from_filename(ckey, fname)
         # When the invoice number comes from the filename, dedup BEFORE downloading.
         if inv:
-            key = (cid, inv)
+            key = (cid, _norm(inv))
             if key in loaded or key in seen:
                 continue
         try:
@@ -110,7 +115,7 @@ def main():
             if not inv:
                 results.append({"carrier": cid, "file": fname, "status": "skip_no_invoice_no"})
                 continue
-            key = (cid, inv)
+            key = (cid, _norm(inv))
             if key in loaded or key in seen:
                 continue
         seen.add(key)
@@ -127,7 +132,12 @@ def main():
         if not ok1:
             results.append({"carrier": cid, "invoice": inv, "status": "load_combined_fail", "error": m1})
             continue
-        ok2, m2 = ingest("surcharge", f"{cid}_{inv}_surcharge.csv", built["surcharge"])
+        # only post the surcharge file when it actually has rows (some invoices have no surcharges)
+        has_surcharge = len([l for l in built["surcharge"].splitlines() if l.strip()]) > 1
+        if has_surcharge:
+            ok2, m2 = ingest("surcharge", f"{cid}_{inv}_surcharge.csv", built["surcharge"])
+        else:
+            ok2, m2 = True, "no surcharges"
         results.append({"carrier": cid, "invoice": inv,
                         "status": "loaded" if ok2 else "loaded_combined_only_surcharge_fail",
                         "lines": built["lines"], "total_eur": built["parsed"], "ratio": round(ratio, 4),
