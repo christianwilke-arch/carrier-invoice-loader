@@ -191,28 +191,34 @@ def build_dpd_fr(raw, fname, inv):
         except Exception: return 0.0
     def cl(x):
         s = "" if x is None else str(x); return "" if s in ("nan","NaN","None") else (s[:-2] if s.endswith(".0") else s)
+    # invoice number lives in the 'No facture' column (one per complement file)
+    from collections import Counter
+    facs = Counter(cl(d.get("No facture")) for d in recs
+                   if cl(d.get("No facture")) and cl(d.get("No facture"))[:1].isdigit())
+    real = facs.most_common(1)[0][0] if facs else (inv or "")
     comb, sur = [], []; seq = 0; total = 0.0
     for d in recs:
-        seq += 1; pn = f"DPDFR-{inv}-{seq:05d}"
-        base = num(d.get(BASE)); line = num(d.get("total_line")); st = round(line - base, 2); total += line
-        comb.append({"carrier":"dpdfr","invoice_id":inv,"invoice_date":"",
-            "tracking":cl(d.get("N° de colis") or d.get("Numéro de colis")).replace(" ",""),"parcel_no":pn,
+        line = num(d.get("total_line")); base = num(d.get(BASE))
+        if line == 0 and base == 0: continue   # skip any footer/blank row
+        seq += 1; pn = f"DPDFR-{real}-{seq:05d}"; st = round(line - base, 2); total += line
+        comb.append({"carrier":"dpdfr","invoice_id":real,"invoice_date":cl(d.get("Date de facture"))[:10],
+            "tracking":cl(d.get("N° Colis")).replace(" ",""),"parcel_no":pn,
             "service_raw":"DPDFR-STANDARD","base_charge":round(base,2),"total_surcharges":st,
-            "total_line_amount":round(line,2),"currency":"EUR","delivery_country":"","delivery_postcode":"",
+            "total_line_amount":round(line,2),"currency":"EUR",
+            "delivery_country":cl(d.get("Code pays destinataire")),"delivery_postcode":cl(d.get("CP destinataire")),
             "weight_kg":round(num(d.get("Poids")),3),"pack_count":int(num(d.get("Nombre de colis"))),
             "order_id":cl(d.get("order_id")),"order_item_id":cl(d.get("order_item_id")),"source_file":os.path.basename(fname)})
-        ship = ""
-        try: ship = str(d.get("Date expédition"))[:10]
-        except Exception: pass
+        ship = cl(d.get("Date expédition"))[:10]
         for c in SUR:
             a = num(d.get(c))
             if abs(a) > 0.005:
-                sur.append({"invoice_id":inv,"tracking":pn,"charge_class":"dpd_fr","charge_code":_slug(c),
+                sur.append({"invoice_id":real,"tracking":pn,"charge_class":"dpd_fr","charge_code":_slug(c),
                     "surcharge_name":c,"amount":round(a,2),"currency":"EUR","source_row_no":"","ship_date":ship,"quantity":""})
     control = gate.get("control_total_ht") or total
     ratio = (total / control) if control else 0.0
     return {"combined": _csv(COMBINED_COLS, comb), "surcharge": _csv(SURCH_COLS, sur),
-            "control": round(control,2), "parsed": round(total,2), "lines": len(comb), "ratio": ratio}
+            "control": round(control,2), "parsed": round(total,2), "lines": len(comb), "ratio": ratio,
+            "invoice_id": real}
 
 # ---------------------------------------------------------------------------
 # Correos Express (FAC_UNICO xlsx) — parcel grain + order_item_id, ties to NETO.
@@ -253,8 +259,7 @@ REGISTRY = {
     "chronopost":      {"match_file": lambda f: f.lower().endswith(".pdf"),  "build": build_chronopost},
     "correos_express": {"match_file": lambda f: f.lower().endswith((".xlsx",".xls")), "build": build_correos_express},
     "dpd_nl":          {"match_file": lambda f: f.lower().endswith(".pdf"), "build": build_dpd_nl},
-    # Validate on the runner (DRY_RUN=1), then uncomment:
-    # "dpd_fr":   {"match_file": lambda f: f.lower().endswith((".xlsx",".xls")), "build": build_dpd_fr},
+    "dpd_fr":          {"match_file": lambda f: f.lower().endswith((".xlsx",".xls")), "build": build_dpd_fr},
     # NOT wirable yet — dhl_be & correos have only total-only stub parsers; postnl & royal_mail
     # have no parser. NOTE dpd_nl is wired but invoice-level only (aggregated invoice, no per-order
     # reconciliation possible from the format).
