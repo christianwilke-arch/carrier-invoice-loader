@@ -213,13 +213,32 @@ def build_dpd_fr(raw, fname, inv):
             "control": round(control,2), "parsed": round(total,2), "lines": len(comb), "ratio": ratio}
 
 # ---------------------------------------------------------------------------
+# Correos Express (FAC_UNICO xlsx) — parcel grain + order_item_id, ties to NETO.
+# The invoice number lives inside the file (not the filename), so the builder
+# returns it and the worker dedups on it. Surcharges come as one residual-to-NETO
+# invoice-level line (the parser itemises base 'porte' only), so ~14% of spend is
+# invoice-level, not per-order — reconciliation still matches the per-parcel base.
+# ---------------------------------------------------------------------------
+def build_correos_express(raw, fname, inv):
+    import parsers.correos_express as m
+    lines = m.parse(_tmp(raw, ".xlsx"))
+    real = (lines[0].invoice_id if lines else None) or inv or ""
+    res = _lines_to_csv(lines, "correos_express", real, os.path.basename(fname))
+    # parser forces base + residual == NETO, so the invoice ties by construction when NETO was found
+    res["ratio"] = 1.0 if res["parsed"] else 0.0
+    res["invoice_id"] = real
+    return res
+
+# ---------------------------------------------------------------------------
 REGISTRY = {
-    "dpd_uk":     {"match_file": lambda f: f.lower().endswith(".csv"),  "build": build_dpd_uk},
-    "dhl_nl":     {"match_file": lambda f: f.lower().endswith(".csv"),  "build": build_dhl_nl},
-    "geodis":     {"match_file": lambda f: f.lower().endswith(".pdf"),  "build": build_geodis},
-    "chronopost": {"match_file": lambda f: f.lower().endswith(".pdf"),  "build": build_chronopost},
+    "dpd_uk":          {"match_file": lambda f: f.lower().endswith(".csv"),  "build": build_dpd_uk},
+    "dhl_nl":          {"match_file": lambda f: f.lower().endswith(".csv"),  "build": build_dhl_nl},
+    "geodis":          {"match_file": lambda f: f.lower().endswith(".pdf"),  "build": build_geodis},
+    "chronopost":      {"match_file": lambda f: f.lower().endswith(".pdf"),  "build": build_chronopost},
+    "correos_express": {"match_file": lambda f: f.lower().endswith((".xlsx",".xls")), "build": build_correos_express},
     # Validate on the runner (DRY_RUN=1), then uncomment:
     # "dpd_fr":   {"match_file": lambda f: f.lower().endswith((".xlsx",".xls")), "build": build_dpd_fr},
-    # TODO add + validate: correos (.txt), correos_express (xlsx), dx (.csv),
-    #                       dpd_nl (.pdf), dhl_be (.pdf), gls_fr, royal_mail
+    # NOT wirable yet — these have only total-only stub parsers (dpd_nl, dhl_be, correos)
+    # or no parser at all (postnl, royal_mail). Each needs its detailed frozen parser
+    # (parcel grain + order_item_id) ported from its carrier audit skill before wiring.
 }
