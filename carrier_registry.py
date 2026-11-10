@@ -62,6 +62,8 @@ def invoice_no_from_filename(ckey, fname):
         m = re.search(r"_(\d{6,9})\.pdf$", base, re.I); return m.group(1) if m else None
     if ckey == "gls_fr":           # "BCF 2501425806 31.10.2026 ...CSV" -> the invoice number
         m = re.search(r"BCF\s+(\d{6,12})", base, re.I); return m.group(1) if m else None
+    if ckey == "postnl":           # Customer_Barcode_1106-2626698_2.1.csv -> 1106-2626698
+        m = re.search(r"(\d{3,4}-\d{5,9})", base); return m.group(1) if m else None
     m = re.search(r"(\d{6,12})", base); return m.group(1) if m else None
 
 # ---------------------------------------------------------------------------
@@ -315,6 +317,58 @@ def _gls_date(s):
     return ""
 
 # ---------------------------------------------------------------------------
+# PostNL — "Customer_Barcode" detail CSV (the PDF lacks detail). ';'-delimited,
+# latin-1, one row per shipment-charge. Per-shipment: base (Verzendtarief/zone) +
+# 'Toeslagen' surcharge rows (named in DESCRIPTION_LEVEL_4). order_item_id from
+# REFERENCE_VALUE_1. Ties on the NET_VALUE sum (no external control in the file).
+# ---------------------------------------------------------------------------
+def build_postnl(raw, fname, inv):
+    text = None
+    for enc in ("latin-1", "utf-8-sig"):
+        try: text = raw.decode(enc); break
+        except Exception: continue
+    rows = list(csv.DictReader(io.StringIO(text), delimiter=";"))
+    def g(r, k): return (r.get(k) or "").strip()
+    def n(s):
+        try: return float((s or "0").replace(",", "."))
+        except Exception: return 0.0
+    def oiid(r):
+        ref = g(r, "REFERENCE_VALUE_1")
+        t = [x for x in ref.split("-") if x.strip()]
+        return (t[0] if t else "", t[1] if len(t) > 1 else "")
+    from collections import OrderedDict, Counter
+    facs = Counter(g(r, "INVOICE_NUMBER") for r in rows if g(r, "INVOICE_NUMBER"))
+    real = facs.most_common(1)[0][0] if facs else (inv or "")
+    groups = OrderedDict()
+    for r in rows:
+        if not g(r, "INVOICE_NUMBER"): continue
+        key = g(r, "SHIPMENT") or f"_noship_{len(groups)}"
+        groups.setdefault(key, []).append(r)
+    comb, sur = [], []; total = 0.0; rn = 0
+    for ship, grp in groups.items():
+        base = sum(n(r.get("NET_VALUE")) for r in grp if g(r, "DESCRIPTION_LEVEL_3") != "Toeslagen")
+        surs = [(g(r, "DESCRIPTION_LEVEL_4") or g(r, "PRODUCT_DESCRIPTION") or "Toeslag", n(r.get("NET_VALUE")))
+                for r in grp if g(r, "DESCRIPTION_LEVEL_3") == "Toeslagen"]
+        st = sum(a for _, a in surs); line = round(base + st, 2)
+        total += line
+        head = grp[0]; oid, oi = oiid(head)
+        comb.append({"carrier":"postnl","invoice_id":real,"invoice_date":g(head,"TRANSACTION_DATE")[:10],
+            "tracking":ship,"parcel_no":ship,"service_raw":g(head,"PRODUCT_DESCRIPTION") or "PostNL",
+            "base_charge":round(base,2),"total_surcharges":round(st,2),"total_line_amount":line,"currency":"EUR",
+            "delivery_country":g(head,"RECIPIENT_COUNTRY"),"delivery_postcode":g(head,"RECIPIENT_ZIPCODE"),
+            "weight_kg":n(head.get("COLLO_WEIGHT")),"pack_count":1,"order_id":oid,"order_item_id":oi,
+            "source_file":os.path.basename(fname)})
+        for lbl, a in surs:
+            if abs(a) > 0.005:
+                sur.append({"invoice_id":real,"tracking":ship,"charge_class":"postnl","charge_code":_slug(lbl),
+                    "surcharge_name":lbl,"amount":round(a,2),"currency":"EUR","source_row_no":rn,"ship_date":g(head,"TRANSACTION_DATE")[:10],"quantity":""})
+                rn += 1
+    total = round(total, 2)
+    return {"combined": _csv(COMBINED_COLS, comb), "surcharge": _csv(SURCH_COLS, sur),
+            "control": total, "parsed": total, "lines": len(comb), "ratio": 1.0 if total else 0.0,
+            "invoice_id": real}
+
+# ---------------------------------------------------------------------------
 REGISTRY = {
     "dpd_uk":          {"match_file": lambda f: f.lower().endswith(".csv"),  "build": build_dpd_uk},
     "dhl_nl":          {"match_file": lambda f: f.lower().endswith(".csv"),  "build": build_dhl_nl},
@@ -324,7 +378,7 @@ REGISTRY = {
     "dpd_nl":          {"match_file": lambda f: f.lower().endswith(".pdf"), "build": build_dpd_nl},
     "dpd_fr":          {"match_file": lambda f: f.lower().endswith((".xlsx",".xls")), "build": build_dpd_fr},
     "gls_fr":          {"match_file": lambda f: f.upper().startswith("BCF") and f.lower().endswith(".csv"), "build": build_gls},
-    # NOT wirable yet — dhl_be & correos have only total-only stub parsers; postnl & royal_mail
-    # have no parser. NOTE dpd_nl is wired but invoice-level only (aggregated invoice, no per-order
-    # reconciliation possible from the format).
+    "postnl":          {"match_file": lambda f: f.lower().endswith(".csv"), "build": build_postnl},
+    # NOT wirable yet — dhl_be & correos have only total-only stub parsers; royal_mail has no parser.
+    # NOTE dpd_nl is wired but invoice-level only (aggregated invoice, no per-order reconciliation).
 }
