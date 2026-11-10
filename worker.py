@@ -123,7 +123,7 @@ def main():
             results.append({"carrier": cid, "invoice": inv, "status": "dry_run_ok",
                             "lines": built["lines"], "total_eur": built["parsed"], "ratio": round(ratio, 4)})
             continue
-        ok1, m1 = ingest("combined", f"{cid}_{inv}_combined.csv", built["combined"])
+        ok1, m1 = ingest("invoice", f"{cid}_{inv}_invoice.csv", built["combined"])
         if not ok1:
             results.append({"carrier": cid, "invoice": inv, "status": "load_combined_fail", "error": m1})
             continue
@@ -133,7 +133,7 @@ def main():
                         "lines": built["lines"], "total_eur": built["parsed"], "ratio": round(ratio, 4),
                         **({} if ok2 else {"error": m2})})
 
-    summary = {"ran_at": datetime.datetime.utcnow().isoformat() + "Z", "dry_run": DRY_RUN,
+    summary = {"ran_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "dry_run": DRY_RUN,
                "stored_seen": len(stored), "handled": len(results),
                "loaded": sum(1 for r in results if r["status"] == "loaded"),
                "tie_fail": sum(1 for r in results if r["status"] == "tie_fail"),
