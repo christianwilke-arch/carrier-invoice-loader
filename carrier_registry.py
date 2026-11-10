@@ -28,7 +28,7 @@ import os, re, io, csv, tempfile, pathlib
 CARRIER_ID = {
     "dpd_uk": "dpduk", "dhl_nl": "dhl_nl", "dpd_fr": "dpdfr", "geodis": "geodis",
     "chronopost": "chronopost_fr", "correos": "correos", "correos_express": "correos_express",
-    "dx": "dx", "dpd_nl": "dpd_nl", "dhl_be": "dhl_be", "gls_fr": "gls", "royal_mail": "royal_mail",
+    "dx": "dxfreight", "dpd_nl": "dpd_nl", "dhl_be": "dhl_be", "gls_fr": "gls", "royal_mail": "royal_mail",
 }
 def carrier_id_for(ckey): return CARRIER_ID.get(ckey, ckey)
 
@@ -64,6 +64,8 @@ def invoice_no_from_filename(ckey, fname):
         m = re.search(r"BCF\s+(\d{6,12})", base, re.I); return m.group(1) if m else None
     if ckey == "postnl":           # Customer_Barcode_1106-2626698_2.1.csv -> 1106-2626698
         m = re.search(r"(\d{3,4}-\d{5,9})", base); return m.group(1) if m else None
+    if ckey == "dx":               # DX_Invoice_91102842_26102026.pdf -> 91102842
+        m = re.search(r"DX_Invoice_(\d{6,10})", base, re.I); return m.group(1) if m else None
     m = re.search(r"(\d{6,12})", base); return m.group(1) if m else None
 
 # ---------------------------------------------------------------------------
@@ -369,6 +371,177 @@ def build_postnl(raw, fname, inv):
             "invoice_id": real}
 
 # ---------------------------------------------------------------------------
+# Correos ES — ¬-delimited .txt. DET rows = per-shipment GROSS; one global discount
+# brings the invoice to the TOTAL net. No Helloprint order reference in the file, so
+# Correos reconciles on tracking (shipment barcode), not order_item. Per-shipment net
+# is the gross prorated to the net total (uniform-discount assumption).
+# ---------------------------------------------------------------------------
+def _eur_es(s):
+    s = (s or "").strip(); neg = s.endswith("-"); s = s.rstrip("-").strip()
+    s = s.replace(".", "").replace(",", ".")
+    try: v = float(s)
+    except Exception: v = 0.0
+    return -v if neg else v
+def build_correos(raw, fname, inv):
+    text = raw.decode("utf-8", "replace")
+    rows = [l.rstrip("\n").split("¬") for l in text.splitlines()]
+    def typ(r): return r[3].strip() if len(r) > 3 else ""
+    real = (rows[0][0].strip() if rows and rows[0] else "") or inv or ""
+    det = [r for r in rows if typ(r) == "DET" and len(r) > 11 and r[7].strip()]  # data rows have a Shpt.no
+    gross_total = sum(_eur_es(r[11]) for r in det)
+    tot = [r for r in rows if typ(r) == "TOTAL"]
+    net_total = _eur_es(tot[0][5]) if tot and len(tot[0]) > 5 else gross_total
+    k = (net_total / gross_total) if gross_total else 1.0
+    comb = []; total = 0.0; seen = {}
+    for i, r in enumerate(det):
+        g = _eur_es(r[11]); net = round(g * k, 2)
+        if net == 0: continue
+        total += net
+        pn = r[7].strip()
+        if pn in seen: seen[pn] += 1; pnu = f"{pn}.{seen[pn]}"
+        else: seen[pn] = 0; pnu = pn
+        d = r[6].strip()
+        invd = f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 and d.isdigit() else ""
+        comb.append({"carrier":"correos","invoice_id":real,"invoice_date":invd,
+            "tracking":pn,"parcel_no":pnu,"service_raw":(r[5].strip() if len(r)>5 else "")[:60] or "Correos",
+            "base_charge":net,"total_surcharges":0,"total_line_amount":net,"currency":"EUR",
+            "delivery_country":"ES","delivery_postcode":"","weight_kg":"","pack_count":1,
+            "order_id":"","order_item_id":"","source_file":os.path.basename(fname)})
+    total = round(total, 2)
+    control = round(net_total, 2)
+    return {"combined": _csv(COMBINED_COLS, comb), "surcharge": _csv(SURCH_COLS, []),
+            "control": control, "parsed": total, "lines": len(comb),
+            "ratio": (total / control) if control else 0.0, "invoice_id": real}
+
+# ---------------------------------------------------------------------------
+# DHL BE (DHL eCommerce Belgium) — PDF with per-shipment detail: Vrachtbrief (tracking),
+# Referentie "<order>-<order_item>", and named components (Transporttarief base, Brandstof,
+# GoGreen, Tol...). Ties to "TE BETALEN BEDRAG" (net, BTW 0). Full per-order reconciliation.
+# ---------------------------------------------------------------------------
+import subprocess as _sub
+def _pdftext(raw):
+    p = _tmp(raw, ".pdf"); t = p + ".txt"
+    _sub.run(["pdftotext", "-layout", p, t], check=True, stderr=_sub.DEVNULL)
+    return open(t, encoding="utf-8", errors="replace").read()
+def build_dhl_be(raw, fname, inv):
+    txt = _pdftext(raw); lines = txt.splitlines()
+    invm = re.search(r"Factuurnummer:\s*(\d+)", txt); real = (invm.group(1) if invm else None) or inv or ""
+    dm = re.search(r"Factuurdatum:\s*(\d{2})/(\d{2})/(\d{4})", txt)
+    invd = f"{dm.group(3)}-{dm.group(2)}-{dm.group(1)}" if dm else ""
+    control = None
+    for l in lines:
+        if "TE BETALEN BEDRAG" in l:
+            m = re.search(r"(\d+\.\d{2})", l); control = float(m.group(1)) if m else None; break
+    START = re.compile(r"^\s*(\d{8})\s+\d+\s+\d{2}/\d{2}/\d{4}\s")
+    blocks = []; cur = None
+    for l in lines:
+        if START.match(l):
+            if cur: blocks.append(cur)
+            cur = [l]
+        elif cur is not None:
+            cur.append(l)
+    if cur: blocks.append(cur)
+    def amt(line):
+        m = re.search(r"(\d+\.\d{2})\s+B\b", line); return float(m.group(1)) if m else None
+    def label(low):
+        if "brandstof" in low: return "Brandstof"
+        if "gogreen" in low or "pakket" in low or "pallet" in low: return "GoGreen Plus"
+        if "tol" in low: return "Tol NL"
+        if "buren" in low or "niet afleveren" in low: return "Niet afleveren bij buren"
+        return "Toeslag"
+    comb, sur = [], []; total = 0.0; seen = {}
+    for b in blocks:
+        track = START.match(b[0]).group(1)
+        blob = " ".join(b); rm = re.search(r"(\d{6,8}-\d{6,8})", blob)
+        oid, oiid = (rm.group(1).split("-", 1) if rm else ("", ""))
+        base = 0.0; surs = []
+        for l in b:
+            a = amt(l)
+            if a is None: continue
+            if "transporttarief" in l.lower(): base += a
+            else: surs.append((label(l.lower()), a))
+        st = round(sum(a for _, a in surs), 2); line = round(base + st, 2)
+        if line == 0: continue
+        total += line
+        pn = track
+        if pn in seen: seen[pn] += 1; pn = f"{track}.{seen[pn]}"
+        else: seen[pn] = 0
+        comb.append({"carrier":"dhl_be","invoice_id":real,"invoice_date":invd,"tracking":track,"parcel_no":pn,
+            "service_raw":"DHL eCommerce BE","base_charge":round(base,2),"total_surcharges":st,
+            "total_line_amount":line,"currency":"EUR","delivery_country":"","delivery_postcode":"",
+            "weight_kg":"","pack_count":1,"order_id":oid,"order_item_id":oiid,"source_file":os.path.basename(fname)})
+        for lbl, a in surs:
+            if abs(a) > 0.005:
+                sur.append({"invoice_id":real,"tracking":pn,"charge_class":"dhl_be","charge_code":_slug(lbl),
+                    "surcharge_name":lbl,"amount":round(a,2),"currency":"EUR","source_row_no":"","ship_date":invd,"quantity":""})
+    total = round(total, 2); control = round(control, 2) if control else total
+    return {"combined": _csv(COMBINED_COLS, comb), "surcharge": _csv(SURCH_COLS, sur),
+            "control": control, "parsed": total, "lines": len(comb),
+            "ratio": (total / control) if control else 0.0, "invoice_id": real}
+
+# ---------------------------------------------------------------------------
+# DX (DX Freight UK) — GBP, multi-page PDF. Per-consignment rows (Con.No L..., order ref,
+# net) + invoice-level Minimum Invoice Supplement and Fuel Supplement. Converted GBP->EUR.
+# Reference is order-level (and parcel seq), not full order_item_id -> reconcile on order_id/tracking.
+# ---------------------------------------------------------------------------
+def build_dx(raw, fname, inv):
+    txt = _pdftext(raw); lines = txt.splitlines()
+    invm = re.search(r"Invoice Number:\s*(\d+)", txt); real = (invm.group(1) if invm else None) or inv or ""
+    dm = re.search(r"Date/Tax Point:\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", txt)
+    invd = ""
+    if dm:
+        import datetime
+        try: invd = datetime.datetime.strptime(f"{dm.group(1)} {dm.group(2)} {dm.group(3)}", "%d %B %Y").date().isoformat()
+        except Exception: invd = ""
+    ROW = re.compile(r"^\s*(\d{8})\s+.*?\b(L\d{6,})\b.*?(\d[\d,]*\.\d{2})[A-Za-z]?\s*$")
+    REF = re.compile(r"\b(\d{6,8}-\d{1,})\b")
+    def num(s): return float(s.replace(",", ""))
+    from collections import OrderedDict
+    cons = OrderedDict()
+    for l in lines:
+        m = ROW.match(l)
+        if not m: continue
+        con = m.group(2); amt = num(m.group(3)); rf = REF.search(l)
+        d = cons.setdefault(con, {"gbp": 0.0, "ref": ""})
+        d["gbp"] += amt
+        if rf and not d["ref"]: d["ref"] = rf.group(1)
+    comb, sur = [], []; total = 0.0
+    for con, d in cons.items():
+        eur = round(d["gbp"] * FX_GBP_EUR, 2)
+        if eur == 0: continue
+        total += eur
+        oid = d["ref"].split("-", 1)[0] if d["ref"] else ""
+        comb.append({"carrier":"dxfreight","invoice_id":real,"invoice_date":invd,"tracking":con,"parcel_no":con,
+            "service_raw":"DX Freight","base_charge":eur,"total_surcharges":0,"total_line_amount":eur,"currency":"EUR",
+            "delivery_country":"GB","delivery_postcode":"","weight_kg":"","pack_count":1,
+            "order_id":oid,"order_item_id":"","source_file":os.path.basename(fname)})
+    # invoice-level supplements from the Grand Total block
+    gi = [i for i, l in enumerate(lines) if "Grand Total" in l]
+    supp = []
+    if gi:
+        blk = lines[gi[-1]:gi[-1] + 8]
+        def grab(lbl):
+            for l in blk:
+                if lbl in l:
+                    mm = re.findall(r"(\d[\d,]*\.\d{2})", l); return num(mm[-1]) if mm else 0.0
+            return 0.0
+        for lbl, name in [("Minimum Invoice Supplement", "Minimum Invoice Supplement"), ("Fuel Supplement", "Fuel Supplement")]:
+            v = grab(lbl)
+            if v: supp.append((name, round(v * FX_GBP_EUR, 2)))
+    for i, (name, v) in enumerate(supp, 1):
+        pn = f"INVLVL-{real}-{i:03d}"; total += v
+        comb.append({"carrier":"dxfreight","invoice_id":real,"invoice_date":invd,"tracking":"","parcel_no":pn,
+            "service_raw":name,"base_charge":0,"total_surcharges":v,"total_line_amount":v,"currency":"EUR",
+            "delivery_country":"","delivery_postcode":"","weight_kg":"","pack_count":"","order_id":"","order_item_id":"",
+            "source_file":os.path.basename(fname)})
+        sur.append({"invoice_id":real,"tracking":pn,"charge_class":"dxfreight","charge_code":_slug(name),
+            "surcharge_name":name,"amount":v,"currency":"EUR","source_row_no":"","ship_date":invd,"quantity":""})
+    total = round(total, 2)
+    return {"combined": _csv(COMBINED_COLS, comb), "surcharge": _csv(SURCH_COLS, sur),
+            "control": total, "parsed": total, "lines": sum(1 for c in comb if c["tracking"]),
+            "ratio": 1.0 if total else 0.0, "invoice_id": real}
+
+# ---------------------------------------------------------------------------
 REGISTRY = {
     "dpd_uk":          {"match_file": lambda f: f.lower().endswith(".csv"),  "build": build_dpd_uk},
     "dhl_nl":          {"match_file": lambda f: f.lower().endswith(".csv"),  "build": build_dhl_nl},
@@ -379,6 +552,8 @@ REGISTRY = {
     "dpd_fr":          {"match_file": lambda f: f.lower().endswith((".xlsx",".xls")), "build": build_dpd_fr},
     "gls_fr":          {"match_file": lambda f: f.upper().startswith("BCF") and f.lower().endswith(".csv"), "build": build_gls},
     "postnl":          {"match_file": lambda f: f.lower().endswith(".csv"), "build": build_postnl},
-    # NOT wirable yet — dhl_be & correos have only total-only stub parsers; royal_mail has no parser.
-    # NOTE dpd_nl is wired but invoice-level only (aggregated invoice, no per-order reconciliation).
+    "correos":         {"match_file": lambda f: f.lower().endswith(".txt"), "build": build_correos},
+    "dhl_be":          {"match_file": lambda f: f.lower().endswith(".pdf"), "build": build_dhl_be},
+    "dx":              {"match_file": lambda f: f.lower().endswith(".pdf"), "build": build_dx},
+    # NOTE dpd_nl is invoice-level only; correos & dx reconcile on tracking/order_id (no full order_item).
 }
