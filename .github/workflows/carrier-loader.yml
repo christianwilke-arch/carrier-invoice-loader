@@ -2,7 +2,7 @@ name: carrier-loader
 
 on:
   schedule:
-    - cron: "37 * * * *"
+    - cron: "0 11 */3 * *"
   workflow_dispatch:
     inputs:
       dry_run:
