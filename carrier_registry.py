@@ -32,7 +32,11 @@ CARRIER_ID = {
 }
 def carrier_id_for(ckey): return CARRIER_ID.get(ckey, ckey)
 
-FX_GBP_EUR = 1.1564
+# FX conversion is NO LONGER done at parse time. Parsers emit native currency
+# (GBP for DPD UK and DX). The dashboard converts on read. Removed 2026-11-13
+# after an audit showed 16.00 GBP oversized surcharges stored as 18.50 EUR with
+# currency=EUR, hiding the original billed amount.
+FX_GBP_EUR = 1.0
 
 COMBINED_COLS = ["carrier","invoice_id","invoice_date","tracking","parcel_no","service_raw","base_charge",
                  "total_surcharges","total_line_amount","currency","delivery_country","delivery_postcode",
@@ -96,8 +100,8 @@ def build_dpd_uk(raw, fname, inv):
             try: inv_date = datetime.datetime.strptime(r[0].strip(), "%d/%m/%Y").date().isoformat()
             except Exception: inv_date = ""
         gbp = sum(_f(r[c]) for c in CHARGE); parcel_gbp += gbp
-        base_e = round((_f(r[15]) + _f(r[31])) * FX_GBP_EUR, 2)
-        line_e = round(gbp * FX_GBP_EUR, 2); eur_total += line_e
+        base_gbp = round(_f(r[15]) + _f(r[31]), 2)
+        line_gbp = round(gbp, 2); eur_total += line_gbp  # eur_total kept for return key; now holds GBP
         ref = r[11] if len(r) > 11 else ""
         nums = [t for t in re.split(r"[-/\s]+", (ref or "").strip()) if t.isdigit()]
         oid = nums[0] if nums else ""; oiid = nums[1] if len(nums) >= 2 else (nums[0] if nums else "")
@@ -109,7 +113,7 @@ def build_dpd_uk(raw, fname, inv):
         except Exception: pass
         comb.append({"carrier":"dpduk","invoice_id":inv,"invoice_date":inv_date,"tracking":r[1],"parcel_no":pn,
             "service_raw": "EXPRESSPAK" if (len(r)>5 and (r[5] or "").strip()=="EXPRESSPAK") else "STANDARD",
-            "base_charge":base_e,"total_surcharges":round(line_e-base_e,2),"total_line_amount":line_e,"currency":"EUR",
+            "base_charge":base_gbp,"total_surcharges":round(line_gbp-base_gbp,2),"total_line_amount":line_gbp,"currency":"GBP",
             "delivery_country": r[36] if len(r)>36 else "", "delivery_postcode": r[10] if len(r)>10 else "",
             "weight_kg": _f(r[12]) if len(r)>12 else "", "pack_count": int(_f(r[13])) if len(r)>13 and _f(r[13]) else 1,
             "order_id": oid, "order_item_id": oiid, "source_file": os.path.basename(fname)})
@@ -118,7 +122,7 @@ def build_dpd_uk(raw, fname, inv):
             v = _f(r[c])
             if abs(v) > 0.005 and c < len(hdr):
                 sur.append({"invoice_id":inv,"tracking":pn,"charge_class":"dpduk","charge_code":_slug(hdr[c]),
-                    "surcharge_name":hdr[c],"amount":round(v*FX_GBP_EUR,2),"currency":"EUR",
+                    "surcharge_name":hdr[c],"amount":round(v,2),"currency":"GBP",
                     "source_row_no":idx,"ship_date":d,"quantity":""})
     ratio = (parcel_gbp / nett) if nett else 0.0
     return {"combined": _csv(COMBINED_COLS, comb), "surcharge": _csv(SURCH_COLS, sur),
@@ -507,12 +511,12 @@ def build_dx(raw, fname, inv):
         if rf and not d["ref"]: d["ref"] = rf.group(1)
     comb, sur = [], []; total = 0.0
     for con, d in cons.items():
-        eur = round(d["gbp"] * FX_GBP_EUR, 2)
-        if eur == 0: continue
-        total += eur
+        gbp = round(d["gbp"], 2)
+        if gbp == 0: continue
+        total += gbp
         oid = d["ref"].split("-", 1)[0] if d["ref"] else ""
         comb.append({"carrier":"dxfreight","invoice_id":real,"invoice_date":invd,"tracking":con,"parcel_no":con,
-            "service_raw":"DX Freight","base_charge":eur,"total_surcharges":0,"total_line_amount":eur,"currency":"EUR",
+            "service_raw":"DX Freight","base_charge":gbp,"total_surcharges":0,"total_line_amount":gbp,"currency":"GBP",
             "delivery_country":"GB","delivery_postcode":"","weight_kg":"","pack_count":1,
             "order_id":oid,"order_item_id":"","source_file":os.path.basename(fname)})
     # invoice-level supplements from the Grand Total block
@@ -527,15 +531,15 @@ def build_dx(raw, fname, inv):
             return 0.0
         for lbl, name in [("Minimum Invoice Supplement", "Minimum Invoice Supplement"), ("Fuel Supplement", "Fuel Supplement")]:
             v = grab(lbl)
-            if v: supp.append((name, round(v * FX_GBP_EUR, 2)))
+            if v: supp.append((name, round(v, 2)))
     for i, (name, v) in enumerate(supp, 1):
         pn = f"INVLVL-{real}-{i:03d}"; total += v
         comb.append({"carrier":"dxfreight","invoice_id":real,"invoice_date":invd,"tracking":"","parcel_no":pn,
-            "service_raw":name,"base_charge":0,"total_surcharges":v,"total_line_amount":v,"currency":"EUR",
+            "service_raw":name,"base_charge":0,"total_surcharges":v,"total_line_amount":v,"currency":"GBP",
             "delivery_country":"","delivery_postcode":"","weight_kg":"","pack_count":"","order_id":"","order_item_id":"",
             "source_file":os.path.basename(fname)})
         sur.append({"invoice_id":real,"tracking":pn,"charge_class":"dxfreight","charge_code":_slug(name),
-            "surcharge_name":name,"amount":v,"currency":"EUR","source_row_no":"","ship_date":invd,"quantity":""})
+            "surcharge_name":name,"amount":v,"currency":"GBP","source_row_no":"","ship_date":invd,"quantity":""})
     total = round(total, 2)
     return {"combined": _csv(COMBINED_COLS, comb), "surcharge": _csv(SURCH_COLS, sur),
             "control": total, "parsed": total, "lines": sum(1 for c in comb if c["tracking"]),
