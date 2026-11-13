@@ -62,8 +62,13 @@ def invoice_no_from_filename(ckey, fname):
         m = re.search(r"(\d{9,12})", base); return m.group(1) if m else None
     if ckey == "chronopost":       # 13796660_...pdf
         m = re.search(r"(\d{8})", base); return m.group(1) if m else None
-    if ckey == "dpd_nl":           # Invoice_319301_26103376.pdf -> invoice no is the 2nd number
-        m = re.search(r"_(\d{6,9})\.pdf$", base, re.I); return m.group(1) if m else None
+    if ckey == "dpd_nl":
+        # CSV: 2026-01_Helloprint B.V._26001922_2026-01-06 1.csv -> 26001922 (8-digit)
+        # PDF (legacy): Invoice_319301_26103376.pdf -> 26103376
+        m = re.search(r"_(\d{8})_\d{4}-\d{2}-\d{2}", base)
+        if m: return m.group(1)
+        m = re.search(r"_(\d{6,9})\.pdf$", base, re.I)
+        return m.group(1) if m else None
     if ckey == "gls_fr":           # "BCF 2501425806 31.10.2026 ...CSV" -> the invoice number
         m = re.search(r"BCF\s+(\d{6,12})", base, re.I); return m.group(1) if m else None
     if ckey == "postnl":           # Customer_Barcode_1106-2626698_2.1.csv -> 1106-2626698
@@ -250,6 +255,110 @@ def build_dpd_nl(raw, fname, inv):
     res["ratio"] = (res["parsed"] / gross) if gross else 0.0
     res["invoice_id"] = real
     return res
+
+def build_dpd_nl_csv(raw, fname, inv):
+    """
+    DPD NL per-parcel detail CSV. Rich format: per-parcel base + 6 named itemized
+    surcharges (Energy, Toll, Peak, System return, Oversized/Overweight with named
+    description, Customs, Other) + dimensions (L/W/H/girth/weight) + Customer parcel
+    reference 1 = '<order_id>-<order_item_id>'. Ties on sum(Total amount) by construction.
+    Replaces the aggregated PDF parser for CSV invoices.
+    """
+    import datetime as _dt
+    text = None
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try: text = raw.decode(enc); break
+        except Exception: continue
+    rows = list(csv.DictReader(io.StringIO(text), delimiter=";"))
+
+    def g(r, k): return (r.get(k) or "").strip()
+    def n(x):
+        s = (x or "").strip().replace(",", ".")
+        try: return float(s)
+        except Exception: return 0.0
+    def ymd(x):
+        x = (x or "").strip()
+        if len(x) == 8 and x.isdigit():
+            return f"{x[0:4]}-{x[4:6]}-{x[6:8]}"
+        return x or ""
+    def ref_split(ref):
+        t = [x for x in (ref or "").split("-") if x.strip().isdigit()]
+        return (t[0] if t else "", t[1] if len(t) > 1 else "")
+
+    from collections import Counter
+    facs = Counter(g(r, "Invoice number") for r in rows if g(r, "Invoice number"))
+    real = facs.most_common(1)[0][0] if facs else (inv or "")
+
+    FIXED_SURCHARGES = [
+        ("Energy surcharge",        "Energy surcharge"),
+        ("Toll surcharge",          "Toll surcharge"),
+        ("Peak surcharge",          "Peak surcharge"),
+        ("System return surcharge", "System return surcharge"),
+        ("Customs surcharge",       "Customs surcharge"),
+        ("Total other surcharges",  "Other surcharges"),
+    ]
+
+    comb, sur = [], []
+    total = 0.0
+    seen = {}
+
+    for i, r in enumerate(rows):
+        if not g(r, "Invoice number"): continue
+        parcel = g(r, "Parcel number")
+        if not parcel: continue
+
+        base = n(r.get("Base price"))
+        osw  = n(r.get("Oversized/Overweight surcharge"))
+        osw_desc = g(r, "Oversized/Overweight description") or "Oversized/Overweight surcharge"
+        fixed = [(nm, n(r.get(col))) for col, nm in FIXED_SURCHARGES]
+
+        line_total_from_row = n(r.get("Total amount"))
+        line = round(line_total_from_row if line_total_from_row else (base + osw + sum(a for _, a in fixed)), 2)
+        if line == 0 and base == 0 and osw == 0 and not any(a for _, a in fixed):
+            continue
+        total += line
+
+        pn = parcel
+        if pn in seen: seen[pn] += 1; pn = f"{parcel}.{seen[pn]}"
+        else: seen[pn] = 0
+
+        invd = ymd(g(r, "Invoice date"))
+        shipd = ymd(g(r, "Shipment date"))
+        oid, oiid = ref_split(g(r, "Customer parcel reference 1") or g(r, "Customer shipment reference 1"))
+
+        weight_kg = round(n(r.get("Weight")) / 1000.0, 3) if n(r.get("Weight")) else ""
+        st = round(line - base, 2)
+
+        comb.append({
+            "carrier": "dpd_nl", "invoice_id": real, "invoice_date": invd,
+            "tracking": parcel, "parcel_no": pn,
+            "service_raw": g(r, "Service") or "DPD NL",
+            "base_charge": round(base, 2), "total_surcharges": st,
+            "total_line_amount": line, "currency": "EUR",
+            "delivery_country": g(r, "Receiver country") or g(r, "Commercial destination country"),
+            "delivery_postcode": g(r, "Receiver ZIP"),
+            "weight_kg": weight_kg, "pack_count": 1,
+            "order_id": oid, "order_item_id": oiid,
+            "source_file": os.path.basename(fname),
+        })
+
+        if abs(osw) > 0.005:
+            sur.append({"invoice_id": real, "tracking": pn, "charge_class": "dpd_nl",
+                "charge_code": _slug(osw_desc), "surcharge_name": osw_desc,
+                "amount": round(osw, 2), "currency": "EUR",
+                "source_row_no": i, "ship_date": shipd, "quantity": ""})
+        for name, amt in fixed:
+            if abs(amt) > 0.005:
+                sur.append({"invoice_id": real, "tracking": pn, "charge_class": "dpd_nl",
+                    "charge_code": _slug(name), "surcharge_name": name,
+                    "amount": round(amt, 2), "currency": "EUR",
+                    "source_row_no": i, "ship_date": shipd, "quantity": ""})
+
+    total = round(total, 2)
+    return {"combined": _csv(COMBINED_COLS, comb), "surcharge": _csv(SURCH_COLS, sur),
+            "control": total, "parsed": total, "lines": len(comb),
+            "ratio": 1.0 if total else 0.0, "invoice_id": real}
+
 
 def build_correos_express(raw, fname, inv):
     import parsers.correos_express as m
@@ -552,7 +661,7 @@ REGISTRY = {
     "geodis":          {"match_file": lambda f: f.lower().endswith(".pdf"),  "build": build_geodis},
     "chronopost":      {"match_file": lambda f: f.lower().endswith(".pdf"),  "build": build_chronopost},
     "correos_express": {"match_file": lambda f: f.lower().endswith((".xlsx",".xls")), "build": build_correos_express},
-    "dpd_nl":          {"match_file": lambda f: f.lower().endswith(".pdf"), "build": build_dpd_nl},
+    "dpd_nl":          {"match_file": lambda f: f.lower().endswith(".csv"), "build": build_dpd_nl_csv},
     "dpd_fr":          {"match_file": lambda f: f.lower().endswith((".xlsx",".xls")), "build": build_dpd_fr},
     "gls_fr":          {"match_file": lambda f: f.upper().startswith("BCF") and f.lower().endswith(".csv"), "build": build_gls},
     "postnl":          {"match_file": lambda f: f.lower().endswith(".csv"), "build": build_postnl},
