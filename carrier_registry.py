@@ -601,6 +601,9 @@ def build_dhl_be(raw, fname, inv):
 # Reference is order-level (and parcel seq), not full order_item_id -> reconcile on order_id/tracking.
 # ---------------------------------------------------------------------------
 def build_dx(raw, fname, inv):
+    # Dispatcher: Drive archive is CSV, legacy Gmail path is PDF.
+    if fname.lower().endswith(".csv"):
+        return build_dx_csv(raw, fname, inv)
     txt = _pdftext(raw); lines = txt.splitlines()
     invm = re.search(r"Invoice Number:\s*(\d+)", txt); real = (invm.group(1) if invm else None) or inv or ""
     dm = re.search(r"Date/Tax Point:\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", txt)
@@ -657,6 +660,141 @@ def build_dx(raw, fname, inv):
             "control": total, "parsed": total, "lines": sum(1 for c in comb if c["tracking"]),
             "ratio": 1.0 if total else 0.0, "invoice_id": real}
 
+
+def build_dx_csv(raw, fname, inv):
+    """
+    DX Freight per-parcel detail CSV. GBP native (no FX at parse time).
+    Schema: Account, Invoice, Depot, Date, Service, Consignment No., Reference,
+    Consignee, Additional Charge Type, Surcharge, Town, Postcode, Type, Item,
+    Weight, Price, VAT Code, ... Invoice-level 'Fuel Supplement' and optional
+    'Minimum Invoice Supplement' rows at the end (col 0 = label, col 1 = amount).
+    Per-parcel rows: Additional Charge Type blank = base charge (Price = base),
+    Additional Charge Type set = surcharge (Price = surcharge amount, name = Add Chg Type).
+    Reference is <order_id>-<order_item_prefix_2digit>; order_item_id resolved
+    downstream by matching Consignment No. against Cube tracking_url (consno=).
+    """
+    text = None
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try: text = raw.decode(enc); break
+        except Exception: continue
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows or len(rows) < 2:
+        return {"combined": _csv(COMBINED_COLS, []), "surcharge": _csv(SURCH_COLS, []),
+                "control": 0.0, "parsed": 0.0, "lines": 0, "ratio": 0.0, "invoice_id": inv or ""}
+
+    hdr = rows[0]
+    def col_idx(name):
+        for i, h in enumerate(hdr):
+            if (h or "").strip().lower() == name.lower(): return i
+        return -1
+    CI = {k: col_idx(k) for k in ("Account","Invoice","Date","Service","Consignment No.",
+          "Reference","Additional Charge Type","Postcode","Type","Weight","Price")}
+
+    def g(r, k):
+        i = CI[k]
+        if i < 0 or i >= len(r): return ""
+        return (r[i] or "").strip()
+    def num(x):
+        try: return float((x or "").replace(",", ""))
+        except Exception: return 0.0
+    def ymd(x):
+        x = (x or "").strip()
+        m = re.match(r"(\d{2})/(\d{2})/(\d{4})$", x)
+        if m: return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+        return ""
+
+    # Invoice number from inside file (second column) if filename didn't give one
+    from collections import Counter, OrderedDict
+    invs = Counter(g(r, "Invoice") for r in rows[1:] if g(r, "Invoice") and g(r, "Invoice").isdigit())
+    real = invs.most_common(1)[0][0] if invs else (inv or "")
+
+    # Group by consignment
+    cons = OrderedDict()
+    for i, r in enumerate(rows[1:], start=1):
+        cno = g(r, "Consignment No.")
+        if not cno: continue
+        d = cons.setdefault(cno, {
+            "base_gbp": 0.0, "surcharges": [], "ref": g(r, "Reference"),
+            "postcode": g(r, "Postcode"), "service": g(r, "Service"),
+            "ptype": g(r, "Type"), "date": ymd(g(r, "Date")), "row_no": i,
+        })
+        add_type = g(r, "Additional Charge Type")
+        price = num(g(r, "Price"))
+        if abs(price) < 0.005: continue
+        if add_type:
+            d["surcharges"].append((add_type, price, i))
+        else:
+            d["base_gbp"] += price
+            d["weight_kg"] = num(g(r, "Weight"))
+
+    comb, sur = [], []
+    total = 0.0
+    seen = {}
+    for cno, d in cons.items():
+        base = round(d["base_gbp"], 2)
+        surs_sum = round(sum(a for _, a, _ in d["surcharges"]), 2)
+        line = round(base + surs_sum, 2)
+        if line == 0: continue
+        total += line
+        ref_parts = [t for t in (d["ref"] or "").split("-") if t.strip().isdigit()]
+        oid = ref_parts[0] if ref_parts else ""
+        pn = cno
+        if pn in seen: seen[pn] += 1; pn = f"{cno}.{seen[pn]}"
+        else: seen[pn] = 0
+        comb.append({
+            "carrier": "dxfreight", "invoice_id": real, "invoice_date": d["date"],
+            "tracking": cno, "parcel_no": pn,
+            "service_raw": d["service"] or "DX Freight",
+            "base_charge": base, "total_surcharges": surs_sum, "total_line_amount": line,
+            "currency": "GBP",
+            "delivery_country": "GB", "delivery_postcode": d["postcode"],
+            "weight_kg": d.get("weight_kg", "") or "", "pack_count": 1,
+            "order_id": oid, "order_item_id": "",  # resolved via Cube tracking_url
+            "source_file": os.path.basename(fname),
+        })
+        for name, amt, row_no in d["surcharges"]:
+            sur.append({
+                "invoice_id": real, "tracking": pn, "charge_class": "dxfreight",
+                "charge_code": _slug(name), "surcharge_name": name,
+                "amount": round(amt, 2), "currency": "GBP",
+                "source_row_no": row_no, "ship_date": d["date"], "quantity": "",
+            })
+
+    # Invoice-level supplements (Fuel Supplement, Minimum Invoice Supplement)
+    supp_names = ("Fuel Supplement", "Minimum Invoice Supplement")
+    seq = 0
+    for r in rows:
+        if not r or not r[0]: continue
+        lbl = r[0].strip()
+        if lbl in supp_names and len(r) > 1:
+            v = num(r[1])
+            if abs(v) < 0.005: continue
+            seq += 1
+            pn = f"INVLVL-{real}-{seq:03d}"
+            total += v
+            comb.append({
+                "carrier": "dxfreight", "invoice_id": real, "invoice_date": "",
+                "tracking": "", "parcel_no": pn, "service_raw": lbl,
+                "base_charge": 0, "total_surcharges": round(v, 2), "total_line_amount": round(v, 2),
+                "currency": "GBP", "delivery_country": "", "delivery_postcode": "",
+                "weight_kg": "", "pack_count": "", "order_id": "", "order_item_id": "",
+                "source_file": os.path.basename(fname),
+            })
+            sur.append({
+                "invoice_id": real, "tracking": pn, "charge_class": "dxfreight",
+                "charge_code": _slug(lbl), "surcharge_name": lbl,
+                "amount": round(v, 2), "currency": "GBP",
+                "source_row_no": "", "ship_date": "", "quantity": "",
+            })
+
+    total = round(total, 2)
+    return {
+        "combined": _csv(COMBINED_COLS, comb), "surcharge": _csv(SURCH_COLS, sur),
+        "control": total, "parsed": total,
+        "lines": sum(1 for c in comb if c["tracking"]),
+        "ratio": 1.0 if total else 0.0, "invoice_id": real,
+    }
+
 # ---------------------------------------------------------------------------
 REGISTRY = {
     "dpd_uk":          {"match_file": lambda f: f.lower().endswith(".csv"),  "build": build_dpd_uk},
@@ -670,6 +808,6 @@ REGISTRY = {
     "postnl":          {"match_file": lambda f: f.lower().endswith(".csv"), "build": build_postnl},
     "correos":         {"match_file": lambda f: f.lower().endswith(".txt"), "build": build_correos},
     "dhl_be":          {"match_file": lambda f: f.lower().endswith(".pdf"), "build": build_dhl_be},
-    "dx":              {"match_file": lambda f: f.lower().endswith(".pdf"), "build": build_dx},
+    "dx":              {"match_file": lambda f: f.lower().endswith((".pdf",".csv")), "build": build_dx},
     # NOTE dpd_nl is invoice-level only; correos & dx reconcile on tracking/order_id (no full order_item).
 }
