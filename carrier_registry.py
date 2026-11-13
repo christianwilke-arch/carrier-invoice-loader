@@ -664,7 +664,7 @@ REGISTRY = {
     "geodis":          {"match_file": lambda f: f.lower().endswith(".pdf"),  "build": build_geodis},
     "chronopost":      {"match_file": lambda f: f.lower().endswith(".pdf"),  "build": build_chronopost},
     "correos_express": {"match_file": lambda f: f.lower().endswith((".xlsx",".xls")), "build": build_correos_express},
-    "dpd_nl":          {"match_file": lambda f: f.lower().endswith(".csv"), "build": build_dpd_nl_csv},
+    "dpd_nl":          {"match_file": lambda f: f.lower().endswith(".csv") and "_invoice_319301_" not in f.lower(), "build": build_dpd_nl_csv},  # exclude customs/VAT returns
     "dpd_fr":          {"match_file": lambda f: f.lower().endswith((".xlsx",".xls")), "build": build_dpd_fr},
     "gls_fr":          {"match_file": lambda f: f.upper().startswith("BCF") and f.lower().endswith(".csv"), "build": build_gls},
     "postnl":          {"match_file": lambda f: f.lower().endswith(".csv"), "build": build_postnl},
