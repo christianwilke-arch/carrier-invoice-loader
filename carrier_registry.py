@@ -63,9 +63,12 @@ def invoice_no_from_filename(ckey, fname):
     if ckey == "chronopost":       # 13796660_...pdf
         m = re.search(r"(\d{8})", base); return m.group(1) if m else None
     if ckey == "dpd_nl":
-        # CSV: 2026-01_Helloprint B.V._26001922_2026-01-06 1.csv -> 26001922 (8-digit)
-        # PDF (legacy): Invoice_319301_26103376.pdf -> 26103376
+        # CSV new: 2026-01_Helloprint B.V._26001922_2026-01-06 1.csv -> 26001922
+        # CSV old: 2026-07_Invoice_319301_40604891.csv -> 40604891
+        # PDF legacy: Invoice_319301_26103376.pdf -> 26103376
         m = re.search(r"_(\d{8})_\d{4}-\d{2}-\d{2}", base)
+        if m: return m.group(1)
+        m = re.search(r"_(\d{8})\.csv$", base, re.I)
         if m: return m.group(1)
         m = re.search(r"_(\d{6,9})\.pdf$", base, re.I)
         return m.group(1) if m else None
